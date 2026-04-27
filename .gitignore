@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local tool caches
+.cache/
+.uv-cache/
+
+# figures
+notebooks/*.py
+notebooks/figures/*.json

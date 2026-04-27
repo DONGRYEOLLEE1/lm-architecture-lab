@@ -1,0 +1,12 @@
+[project]
+name = "ai-research"
+version = "0.1.0"
+description = "Reference PyTorch implementations of modern sequence models"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "einops>=0.8.2",
+    "matplotlib>=3.9.0",
+    "numpy>=2.4.4",
+    "torch>=2.11.0",
+]
