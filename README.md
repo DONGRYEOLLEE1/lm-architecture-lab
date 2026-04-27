@@ -69,8 +69,9 @@ All experiments use the same toy configuration: `hidden_size=128`, `num_layers=4
 
 Anchoring on parameter count first — every speed and memory curve below should be read with these in mind.
 
-
-
+<p align="center">
+  <img src="notebooks/figures/parameter_count_comparison.png" width="720"/>
+</p>
 
 | Model                | Parameters |
 | -------------------- | ---------- |
@@ -90,8 +91,9 @@ The two Mamba variants are nearly identical at this scale — Mamba-2's SSD rest
 
 At toy scale the SDPA-based stacks dominate everything else by an order of magnitude — including the linear-recurrence models that are theoretically supposed to win at long L.
 
-
-
+<p align="center">
+  <img src="notebooks/figures/inference_time_vs_sequence_length.png" width="720"/>
+</p>
 
 | L    | Attention  | Mamba   | Mamba-2 | xLSTM    | LFM2       | Gemma 4 |
 | ---- | ---------- | ------- | ------- | -------- | ---------- | ------- |
@@ -111,8 +113,9 @@ At toy scale the SDPA-based stacks dominate everything else by an order of magni
 
 Pushing `L` to 32k surfaces the architectural crossover the linear-time designs are built for.
 
-
-
+<p align="center">
+  <img src="notebooks/figures/inference_time_long_context_scaling.png" width="780"/>
+</p>
 
 | L          | Attention     | Mamba        | Mamba-2      | xLSTM         | LFM2          | Gemma 4 |
 | ---------- | ------------- | ------------ | ------------ | ------------- | ------------- | ------- |
@@ -139,8 +142,9 @@ At L=32k the picture inverts completely: dense attention takes **44 seconds** fo
 
 Where time costs separate the architectures by an order of magnitude, memory costs separate them by **two**. The chart is on log-log axes for that reason.
 
-
-
+<p align="center">
+  <img src="notebooks/figures/memory_vs_sequence_length_long.png" width="780"/>
+</p>
 
 | L          | Attention      | Mamba         | Mamba-2       | xLSTM         | LFM2           | Gemma 4        |
 | ---------- | -------------- | ------------- | ------------- | ------------- | -------------- | -------------- |
@@ -165,9 +169,13 @@ The methodology: peak memory is the larger of (i) `torch.mps.driver_allocated_me
 
 Apple Silicon's unified memory pool means both CPU and MPS see the same 48 GB, so the question isn't *can we fit on the GPU* but *do we want to*.
 
+<p align="center">
+  <img src="notebooks/figures/cpu_vs_mps_time.png" width="780"/>
+</p>
 
-
-
+<p align="center">
+  <img src="notebooks/figures/cpu_vs_mps_speedup.png" width="780"/>
+</p>
 
 
 | Model         | L        | CPU      | MPS       | Speedup                                  |
@@ -201,8 +209,9 @@ Apple Silicon's unified memory pool means both CPU and MPS see the same 48 GB, s
 
 Sequence length held constant at 1024; only the batch dimension grows. The question is which architectures actually amortize their per-step overhead and turn the extra FLOPs into more tokens per second.
 
-
-
+<p align="center">
+  <img src="notebooks/figures/throughput_vs_batch_size.png" width="780"/>
+</p>
 
 | B                 | Attention   | Mamba      | Mamba-2    | xLSTM      | LFM2        | Gemma 4     |
 | ----------------- | ----------- | ---------- | ---------- | ---------- | ----------- | ----------- |
@@ -226,8 +235,9 @@ The SDPA stacks (Attention, LFM2, Gemma 4) only gain 1.3–1.5× because they're
 
 For each model we run forward at three dtypes and measure both wall-clock latency and the mean absolute error of logits relative to the fp32 anchor.
 
-
-
+<p align="center">
+  <img src="notebooks/figures/mixed_precision_benchmark.png" width="780"/>
+</p>
 
 | Model     | fp32      | bf16 (×, MAE)  | fp16 (×, MAE)  |
 | --------- | --------- | -------------- | -------------- |
