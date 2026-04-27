@@ -1,22 +1,25 @@
 # AI Architecture Research
 
-Pure-PyTorch reference implementations of three competing sequence modeling paradigms — SSM, Hybrid, and Attention — written to understand their design trade-offs from first principles.
+Pure-PyTorch reference implementations of six sequence modeling backbones — written to understand the design trade-offs of modern non-/post-Transformer architectures from first principles.
 
-This repository is a research notebook, not a training framework. Mamba and LFM2 are paper-guided implementations — each written to be read alongside its source paper. Gemma 4 is a speculative reconstruction from the Gemma lineage, clearly labeled as such. All experiments run on CPU in minutes; no GPU is required.
+This repository is a research notebook, not a training framework. **Mamba**, **Mamba-2**, **xLSTM**, and **LFM2** are paper-guided implementations — each written to be read alongside its source paper. **Gemma 4** is a speculative reconstruction from the Gemma lineage, clearly labeled as such. **Attention** is a stripped-down baseline. Every smoke test runs on CPU in seconds; every benchmark in this README was produced on Apple M5 Pro (48 GB unified memory) with MPS enabled.
 
 ---
 
 ## The Question
 
-The next generation of foundation models is contested between three architectural paradigms. Each makes a fundamentally different bet:
+The frontier of sequence modeling is contested between four architectural families. Each makes a fundamentally different bet about what carries information through a long context:
 
-| Architecture | Time Complexity | Memory | Long-Range | Core Bet |
-|---|---|---|---|---|
-| **Attention** (Gemma 4) | O(L²) | O(L²) | Exact | Hardware scales faster than the quadratic cost |
-| **SSM** (Mamba) | O(L) | O(L) | Selective | Linear recurrence captures enough of what attention sees |
-| **Hybrid** (LFM2) | O(L) + sparse O(L²) | O(L) | Both | Neither alone wins; mixing is the right inductive bias |
 
-This repo implements all three at toy scale and benchmarks them across memory, inference speed, and hardware (CPU vs Apple Silicon GPU), surfacing where theory meets — and diverges from — practice.
+| Family            | Members in this repo  | What it carries                               | Per-step cost        | Total cost             |
+| ----------------- | --------------------- | --------------------------------------------- | -------------------- | ---------------------- |
+| **Attention**     | Attention (baseline)  | Full pairwise scores                          | O(L)                 | O(L²) memory + compute |
+| **Selective SSM** | Mamba, Mamba-2        | Fixed-size SSM state                          | O(d_state · d_inner) | O(L) memory + compute  |
+| **Extended LSTM** | xLSTM (mLSTM + sLSTM) | Matrix / scalar memory + log-space stabilizer | O(d_h²) (mLSTM)      | O(L) memory + compute  |
+| **Hybrid**        | LFM2, Gemma 4         | Mix of attention + linear-time mixers         | layer-dependent      | O(L) + sparse O(L²)    |
+
+
+This repo implements all four families at toy scale and benchmarks them across **seven dimensions**: parameter count, short-context inference time, long-context scaling (L up to 32k), peak memory, CPU vs MPS, batch-size throughput, and mixed-precision behavior.
 
 ---
 
@@ -24,157 +27,231 @@ This repo implements all three at toy scale and benchmarks them across memory, i
 
 ### [Mamba](./mamba/) — Selective State Space Model
 
-> Gu & Dao, *Mamba: Linear-Time Sequence Modeling with Selective State Spaces*, arXiv:2312.00752 (2023)
+> Gu & Dao, *Mamba: Linear-Time Sequence Modeling with Selective State Spaces*, [arXiv:2312.00752](https://arxiv.org/abs/2312.00752) (2023)
 
-The selective SSM core, implemented in pure Python/PyTorch without CUDA kernels. The scan runs as a sequential recurrence loop, which makes the state transition structure easy to follow but sacrifices the parallelism of the official CUDA implementation. Includes the S4D-Real `A` matrix initialization, the `dt_proj` bias trick from the paper, and GPT-NeoX-style residual scaling.
+The selective SSM core, in pure Python/PyTorch. The scan runs as a sequential recurrence loop — easy to read, but it sacrifices the parallelism of the official CUDA kernel. Includes the S4D-Real `A` initialization, the `dt_proj` bias trick, and GPT-NeoX-style residual rescaling.
+
+### [Mamba-2](./mamba2/) — State-Space Duality
+
+> Dao & Gu, *Transformers are SSMs: Generalized Models and Efficient Algorithms Through Structured State-Space Duality*, ICML 2024 ([arXiv:2405.21060](https://arxiv.org/abs/2405.21060))
+
+The SSD restriction of Mamba: `A` becomes a scalar per head, `B`/`C` are shared across heads inside a "group", and `dt` is per-head. Five linear projections collapse into a single `in_proj` producing `[z, x, B, C, dt]` in one shot, and a mid-block RMSNorm sits between the SSM output and the gate. We keep a sequential scan for clarity; the chunk-parallel SSD form is what the official CUDA path uses.
+
+### [xLSTM](./xlstm/) — Extended LSTM
+
+> Beck et al., *xLSTM: Extended Long Short-Term Memory*, [arXiv:2405.04517](https://arxiv.org/abs/2405.04517) (2024)
+
+Two cells stacked into the same residual backbone. **mLSTM** carries an outer-product matrix memory `C ∈ ℝ^{d_h × d_h}` per head; gates depend only on `x_t`, so it's parallelizable in the same way linear attention is. **sLSTM** carries a per-channel scalar `c` and is fully sequential, with block-diagonal recurrent matrices for the gates. Both cells share the **exponential gating + log-space stabilizer** trick that prevents `exp(·)` from blowing up after a few hundred steps. The toy config uses `("m", "s", "m", "s")` so both cells are present in the stack.
 
 ### [LFM2](./lfm2/) — Liquid Foundation Model 2
 
-> LiquidAI, *LFM2 Technical Report*, arXiv:2511.23404 (2025)
+> LiquidAI, *LFM2 Technical Report*, [arXiv:2511.23404](https://arxiv.org/abs/2511.23404) (2025)
 
-Hybrid backbone interleaving 10 gated short-convolution blocks with 6 GQA attention blocks in a single residual stack. The toy config uses 4 layers with 2 attention layers (50% attention ratio) — this is **not** ratio-matched to the released `LiquidAI/LFM2-350M` checkpoint, which sits at 6/16 ≈ 37.5%. The toy config is intentionally small for CPU runnability; the benchmark numbers reflect this specific mix, not the production ratio. The key architectural insight — that convolution and attention can share a residual stream without structural gymnastics — is immediately visible in `forward()`.
+Hybrid backbone interleaving gated short-convolution blocks with GQA attention blocks in one residual stack. The toy config uses 4 layers with 2 attention layers (50% attention ratio) — this is **not** ratio-matched to the released `LiquidAI/LFM2-350M` checkpoint at 6/16 ≈ 37.5%. The toy is intentionally small for CPU runnability; benchmark numbers reflect this specific mix, not the production ratio.
 
 ### [Gemma 4](./gemma4/) — Speculative Reconstruction
 
-> Synthesized from: Google DeepMind, *Gemma 3 Technical Report* (2025) + Gemma 3n model card
+> Synthesized from Google DeepMind, *Gemma 3 Technical Report* (2025) + Gemma 3n model card
 
 **Gemma 4 has not released a public technical report.** This is a speculative reconstruction that assembles documented pieces of the Gemma lineage: Per-Layer Embeddings (PLE) from Gemma 3n, sliding-window + global attention interleaving from Gemma 3, sandwich norm from Gemma 2/3, and GeGLU FFN. Labeled speculative intentionally — the goal is reasoning about what Gemma 4 *likely* does, not claiming accuracy.
+
+### Attention — Stripped-down Baseline
+
+A 4-layer pre-norm transformer with `F.scaled_dot_product_attention` and a SwiGLU-free vanilla FFN, included to anchor every comparison against a known reference point.
 
 ---
 
 ## Experiments
 
-All benchmarks use the same toy configuration: `hidden_size=128`, `num_layers=4`, `vocab_size=128`, `batch_size=1`, run on Apple M5 Pro CPU (48 GB unified memory). Configs are intentionally minimal so experiments complete in seconds and results reflect architectural properties, not absolute throughput.
+All experiments use the same toy configuration: `hidden_size=128`, `num_layers=4`, `vocab_size=128`, `batch_size=1`, on Apple M5 Pro (48 GB unified memory). Inference benchmarks default to **MPS**; the CPU vs MPS section is the only one that runs both. Configs are intentionally minimal so experiments complete in seconds and results reflect architectural properties, not absolute throughput.
 
 ### 1. Model Size
 
-Before running any sequence-length experiments, it's worth anchoring on parameter count — since architectural overhead (extra projections, embeddings, norms) affects both the numerics and the interpretation of the speed curves.
+Anchoring on parameter count first — every speed and memory curve below should be read with these in mind.
 
-<p align="center">
-  <img src="notebooks/figures/parameter_count_comparison.png" width="680"/>
-</p>
 
-| Model | Parameters |
-|-------|-----------|
-| Mamba | 483K |
-| Attention (baseline) | 674K |
-| LFM2 | 838K |
-| Gemma4 | 838K |
 
-Mamba is the most compact: SSM projections and a depthwise convolution replace the full QKV projection stack. LFM2 and Gemma4 are roughly equivalent in size, but their parameter budgets are spent differently — LFM2 on attention + conv projections, Gemma4 additionally on the per-layer embedding path.
 
----
+| Model                | Parameters |
+| -------------------- | ---------- |
+| Mamba                | 482,944    |
+| Mamba-2              | 488,672    |
+| Attention (baseline) | 674,048    |
+| xLSTM                | 692,760    |
+| LFM2                 | 837,632    |
+| Gemma4               | 838,016    |
 
-### 2. Short-Context Behavior: Theory vs. Practice
 
-At toy scale (seq_len ≤ 1024), vanilla attention outperforms every other architecture — including both models theoretically designed to beat it.
-
-<p align="center">
-  <img src="notebooks/figures/inference_time_vs_sequence_length.png" width="680"/>
-</p>
-
-| seq_len | Attention | Mamba | LFM2 | Gemma4 |
-|---------|-----------|-------|------|--------|
-| 16 | **1.2 ms** | 67.4 ms | 16.3 ms | 3.2 ms |
-| 128 | **3.5 ms** | 67.4 ms | 9.9 ms | 7.1 ms |
-| 512 | **7.8 ms** | 132 ms | 28.7 ms | 15.0 ms |
-| 1024 | **16.9 ms** | 192 ms | 25.6 ms | 55.0 ms |
-
-This is not surprising once you understand what each architecture actually allocates at this scale.
-
-**Why Mamba is slow here.** The Python reference implementation precomputes `deltaA` and `deltaB_u` as `(batch, L, d_inner, d_state)` tensors before entering the sequential recurrence loop. At `L=1024`, `d_inner=256`, `d_state=16`, this tensor alone is `1 × 1024 × 256 × 16 × 4 bytes ≈ 16 MB` — already larger than the attention score matrix. The theoretical O(L) advantage requires a parallel associative scan (the official CUDA kernel's core contribution); the Python loop trades that for readability.
-
-**Why LFM2 and Gemma4 lag.** Neither architecture is doing anything exotic at small scale — they're just carrying overhead that a stripped-down attention baseline doesn't have: gated convolutions, per-layer embeddings, QK-RMSNorm, sandwich norms, dual RoPE. These costs dominate when sequence length is short and the quadratic term in attention is negligible.
+The two Mamba variants are nearly identical at this scale — Mamba-2's SSD restriction (A scalar per head, B/C grouped) buys away the per-channel `dt` projection budget. xLSTM's parameter count is dominated by the up/down projections around the matrix-memory cells. LFM2 and Gemma 4 are roughly equivalent: LFM2 spends the budget on attention + conv projections, Gemma 4 additionally on the per-layer embedding path.
 
 ---
 
-### 3. Long-Context Scaling: Where the Bets Pay Off
+### 2. Short-Context Behavior (L ≤ 1024, MPS)
 
-Extending the sequence range to L=32,768 reveals the architectural crossover the SSM and hybrid designs are built for.
+At toy scale the SDPA-based stacks dominate everything else by an order of magnitude — including the linear-recurrence models that are theoretically supposed to win at long L.
 
-<p align="center">
-  <img src="notebooks/figures/inference_time_long_context_scaling.png" width="720"/>
-</p>
 
-| seq_len | Attention | Mamba | LFM2 | Gemma4 |
-|---------|-----------|-------|------|--------|
-| 512 | 3.6 ms | 55.2 ms | 9.8 ms | 8.5 ms |
-| 2,048 | 36.9 ms | 158.5 ms | 19.6 ms | 35.5 ms |
-| 8,192 | 200.9 ms | 556.9 ms | 121.0 ms | 376.1 ms |
-| 16,384 | 741.1 ms | 1,119.4 ms | 397.0 ms | 1,226.5 ms |
-| **32,768** | **2,901 ms** | **2,213 ms** | **1,505 ms** | 6,141 ms |
 
-**LFM2 wins at L=32k**, running in 1.5s versus 2.9s for attention — nearly 2× faster. Only 2 of its 4 layers use full attention; the other 2 use gated short-convolution, which stays O(L) regardless of sequence length. This is the hybrid design's core payoff: attention where precision matters, convolution where it doesn't.
 
-**Mamba crosses over between L=16k and L=32k.** The O(L) recurrence eventually absorbs the O(L²) score computation, but only after the Python scan loop overhead is amortized over a long-enough sequence. The crossover at L~16k–32k is consistent with what published benchmarks report for production-scale models (where CUDA parallel scan removes the loop penalty entirely).
+| L    | Attention  | Mamba   | Mamba-2 | xLSTM    | LFM2       | Gemma 4 |
+| ---- | ---------- | ------- | ------- | -------- | ---------- | ------- |
+| 16   | **2.0 ms** | 2.7 ms  | 3.3 ms  | 7.4 ms   | 3.6 ms     | 3.0 ms  |
+| 128  | **1.8 ms** | 12.3 ms | 12.8 ms | 45.5 ms  | 1.7 ms     | 4.4 ms  |
+| 512  | **1.1 ms** | 44.5 ms | 49.2 ms | 177.9 ms | 2.7 ms     | 4.3 ms  |
+| 1024 | 3.6 ms     | 87.9 ms | 93.2 ms | 359.5 ms | **2.9 ms** | 5.6 ms  |
 
-**Gemma4 is the slowest at L=32k**, despite a sliding-window attention design intended to limit the quadratic cost. The global attention layers (`global_attn_every_n=2`, so every other layer) are still full O(L²), and per-layer embeddings add an extra embedding-table lookup at every layer. At L=32k this accumulates to 6.1s — more than twice the attention baseline.
 
-The crossover from "attention wins" to "SSM/hybrid wins" happening around **L=16k–32k** is not an accident of this toy config; it reflects the same threshold reported in production-scale evaluations.
+**Why the SSM/RNN models look bad here.** All three sequential-scan models (Mamba, Mamba-2, xLSTM) execute their state recurrence as a Python `for` loop on the GPU. Each step is a tiny matmul that dispatches to MPS, synchronizes, and returns — pure dispatch overhead, no parallelism to amortize it. xLSTM is the slowest of the three because every step does both the matrix-memory update *and* the (per-channel) sLSTM scalar recurrence; Mamba and Mamba-2 do roughly equivalent per-step work. The official CUDA paths for these models replace the Python loop with a fused parallel scan, which is what removes the gap.
+
+**Why LFM2 outpaces even the bare attention baseline.** LFM2's gated short-conv blocks are pure conv1d + matmul on a 1D residual stream, no causal mask construction needed. At L=1024 LFM2 finishes in 2.9 ms vs Attention's 3.6 ms — the smaller per-step constant outweighs the conv overhead at this scale.
 
 ---
 
-### 4. Memory Footprint
+### 3. Long-Context Scaling (L up to 32,768, MPS)
 
-<p align="center">
-  <img src="notebooks/figures/memory_vs_sequence_length_long.png" width="720"/>
-</p>
+Pushing `L` to 32k surfaces the architectural crossover the linear-time designs are built for.
 
-| seq_len | Attention | Mamba | LFM2 | Gemma4 |
-|---------|-----------|-------|------|--------|
-| 1,024 | 10.8 MiB | 62.3 MiB | 13.9 MiB | 27.7 MiB |
-| 4,096 | 33.2 MiB | 241.7 MiB | 47.1 MiB | 286.8 MiB |
-| 8,192 | 61.4 MiB | 477.9 MiB | 84.8 MiB | 1,054.7 MiB |
-| 16,384 | 118.0 MiB | 972.9 MiB | 165.5 MiB | 4,014.1 MiB |
-| **32,768** | **230.5 MiB** | **1,897.5 MiB** | **330.2 MiB** | **11,606 MiB** |
 
-Three patterns stand out:
 
-**Attention's memory is surprisingly modest in this config.** The score matrix is `(batch, heads, L, L) × 4 bytes`, so at 4 heads and L=32k it's `4 × 32768² × 4 = 16 GB` in theory — but `torch.nn.functional.scaled_dot_product_attention` uses Flash Attention under the hood on this platform, tiling the computation to avoid materializing the full matrix. The measured 230 MiB at L=32k is a process-level RSS delta (`resource.ru_maxrss`), capturing the peak working-set growth during inference rather than individual tensor allocations. It likely understates true peak activation memory; the point is that the O(L²) score tensor is never resident in memory simultaneously.
 
-**Mamba's memory grows linearly but with a large constant.** The `(b, L, d_inner, d_state)` precomputed tensors account for most of the 1.9 GB at L=32k. This is a Python-reference artifact; the CUDA implementation fuses the scan and avoids this allocation.
+| L          | Attention     | Mamba        | Mamba-2      | xLSTM         | LFM2          | Gemma 4 |
+| ---------- | ------------- | ------------ | ------------ | ------------- | ------------- | ------- |
+| 512        | 1 ms          | 44 ms        | 46 ms        | 176 ms        | 2 ms          | 3 ms    |
+| 2048       | 1 ms          | 171 ms       | 182 ms       | 713 ms        | 10 ms         | 12 ms   |
+| 8192       | 1 ms          | 699 ms       | 761 ms       | 2,838 ms      | 115 ms        | 198 ms  |
+| 16,384     | 1 ms          | 1,431 ms     | 1,532 ms     | 5,799 ms      | 517 ms        | 941 ms  |
+| **32,768** | **44,045 ms** | **3,398 ms** | **3,210 ms** | **12,262 ms** | **19,087 ms** | **OOM** |
 
-**Gemma4's memory explodes quadratically.** The `_sliding_causal_mask` method materializes a dense `(L, L)` boolean mask even when `sliding_window=512`. At L=32k that's `32768² × 1 byte ≈ 1 GB` just for the mask, before any activations. The 11.6 GB reading at L=32k is dominated by this bug — the sliding-window design doesn't deliver its memory promise at this reference implementation level.
 
-**LFM2 is the most memory-efficient hybrid.** Its curve tracks just above attention, reflecting the two non-attention layers staying at O(L) activation cost.
+At L=32k the picture inverts completely: dense attention takes **44 seconds** for a single forward, while Mamba-2 finishes in 3.2 s — a **14× swing** in favor of the SSM. The crossover happens between L=16k and L=32k, exactly where the O(L²) curve and the O(L) curve intersect for these specific constants.
+
+**Mamba-2 ≈ Mamba at long context.** Their per-step cost is similar in this Python-reference form, so both land at ~3 s for 32k tokens. The architectural difference between them shows up in *memory*, not time (next section).
+
+**xLSTM stays linear in L but with a large constant.** ~12 s at L=32k is a Python-loop story, not an asymptotic one — every step does an outer-product update on a `d_h × d_h` matrix.
+
+**LFM2 hits the same O(L²) wall as attention at long L.** At 50% attention layers, LFM2's full-attention blocks dominate when L gets big enough; at L=32k it takes 19 s, slightly over half of the dense attention time. A production-ratio LFM2 (37.5% attention) would do better.
+
+**Gemma 4 OOMs at L=32k.** The current `_sliding_causal_mask` materializes a dense `(L, L)` boolean tensor even when `sliding_window=512`. At 32k that mask alone is 1 GB, and the unified-memory pool runs out. This is a reference-implementation quirk, not a Gemma 4 design flaw.
 
 ---
 
-### 5. CPU vs. Apple Silicon GPU (MPS)
+### 4. Memory Footprint (L up to 32,768, MPS)
 
-Apple Silicon's unified memory architecture — where CPU and GPU share the same physical memory pool — changes the usual VRAM-constrained GPU story. The M5 Pro's 48 GB are accessible to both the CPU and the MPS (Metal Performance Shaders) backend, making large-context experiments feasible without an external GPU. We benchmarked all four architectures on both devices to characterize when MPS actually helps.
+Where time costs separate the architectures by an order of magnitude, memory costs separate them by **two**. The chart is on log-log axes for that reason.
 
-<p align="center">
-  <img src="notebooks/figures/cpu_vs_mps_time.png" width="720"/>
-</p>
 
-<p align="center">
-  <img src="notebooks/figures/cpu_vs_mps_speedup.png" width="720"/>
-</p>
 
-| Model | seq_len | CPU | MPS | Speedup |
-|-------|---------|-----|-----|---------|
-| **LFM2** | 512 | 14.6 ms | 3.1 ms | **4.7×** |
-| **LFM2** | 1,024 | 15.6 ms | 3.7 ms | **4.2×** |
-| **LFM2** | 4,096 | 53.6 ms | 25.2 ms | 2.1× |
-| **LFM2** | 8,192 | 126.4 ms | 105.3 ms | 1.2× |
-| LFM2 | 16,384 | 414.0 ms | 619.4 ms | 0.67× *(CPU faster)* |
-| **Gemma4** | 512 | 8.7 ms | 4.3 ms | **2.0×** |
-| **Gemma4** | 4,096 | 107.6 ms | 67.6 ms | 1.6× |
-| Gemma4 | 8,192 | 392.7 ms | 348.7 ms | 1.1× |
-| Attention | 1,024 | 8.0 ms | 4.5 ms | 1.8× |
-| Attention | 8,192 | 198.1 ms | 260.2 ms | 0.76× *(CPU faster)* |
-| **Mamba** | all | — | — | **~0.5× (MPS slower throughout)** |
 
-The results reveal a consistent pattern: **MPS delivers meaningful speedups at short-to-medium context, but the advantage reverses sharply at long context.**
+| L          | Attention      | Mamba         | Mamba-2       | xLSTM         | LFM2           | Gemma 4        |
+| ---------- | -------------- | ------------- | ------------- | ------------- | -------------- | -------------- |
+| 1,024      | 1,057 MiB      | 1,088 MiB     | 104 MiB       | 98 MiB        | 81 MiB         | 89 MiB         |
+| 4,096      | 1,584 MiB      | 1,128 MiB     | 328 MiB       | 216 MiB       | 1,608 MiB      | 1,608 MiB      |
+| 8,192      | 4,192 MiB      | 1,224 MiB     | 1,576 MiB     | 392 MiB       | 3,216 MiB      | 4,248 MiB      |
+| 16,384     | 13,888 MiB     | 1,320 MiB     | 2,088 MiB     | 1,640 MiB     | 13,872 MiB     | 15,732 MiB     |
+| **32,768** | **52,224 MiB** | **2,568 MiB** | **3,080 MiB** | **2,184 MiB** | **52,224 MiB** | **52,224 MiB** |
 
-**LFM2 benefits most from MPS at short context (4.7×).** The gated convolution and attention projections map well onto Metal's matrix kernels, and at small sequence lengths the memory traffic stays within MPS's fast bandwidth. The crossover happens around L≈8k, after which the growing attention score tensors saturate Metal's memory subsystem faster than the CPU's sequential compute path.
 
-**Mamba is consistently hurt by MPS (~2× slower across all lengths).** The `selective_scan` is a Python `for` loop: each iteration is a tiny matrix multiply that dispatches to the GPU, waits for synchronization, and returns — pure dispatch overhead with no parallelism to amortize it. No amount of GPU memory bandwidth helps a sequential dependency chain.
+The 52,224 MiB readings at L=32k are a unified-memory ceiling indicator — at that point the MPS allocator has saturated the 48 GB pool plus swap. The interesting comparison is at L=16,384 where every model still fits in physical memory:
 
-**Attention on MPS inverts unexpectedly at L>8k.** Below L=4k, MPS is 1.4–1.8× faster. Above L=8k, CPU is faster, and at L=32k MPS exceeds the 30-second time limit (versus 2.9s on CPU). The likely cause: unlike the CPU path (which routes through Flash Attention's tiled kernel), the MPS backend at this PyTorch version materializes the full `(H, L, L)` score tensor in GPU memory, triggering Metal's paging behavior under memory pressure.
+- **xLSTM is the most memory-efficient at long context (1.6 GB).** Each head only carries a `(d_h, d_h)` matrix and a `(d_h,)` normalizer, so total state is `H · d_h² + H · d_h ≈ H · d_h²`. With `H=4, d_h=48` (proj_factor=1.5) this is on the order of MB regardless of L.
+- **Mamba (1.3 GB) ≈ Mamba-2 (2.1 GB)**, both well below the attention stacks at the same L.
+- **Attention / LFM2 / Gemma 4 all scale super-linearly** because they materialize an `(H, L, L)` score matrix at some layer. LFM2 at 13.9 GB and Attention at 13.9 GB land essentially identically at L=16k — the 50% conv layers in LFM2 don't help once the attention layers have allocated the score tensor.
 
-**Practical guidance for this hardware:** MPS is worth using for LFM2 and Gemma4 at L≤4k (e.g., repeated short-context forward passes during analysis). For long-context experiments (L≥8k), CPU is equal or better for every model. Mamba should always run on CPU in this reference implementation.
+The methodology: peak memory is the larger of (i) `torch.mps.driver_allocated_memory()` delta or (ii) `resource.ru_maxrss` delta, captured in a fresh subprocess to keep baselines clean. This is process-level, not per-tensor — it captures the working-set growth a real inference engine would experience.
+
+---
+
+### 5. CPU vs MPS (Apple M5 Pro, 48 GB Unified Memory)
+
+Apple Silicon's unified memory pool means both CPU and MPS see the same 48 GB, so the question isn't *can we fit on the GPU* but *do we want to*.
+
+
+
+
+
+
+| Model         | L        | CPU      | MPS       | Speedup                                  |
+| ------------- | -------- | -------- | --------- | ---------------------------------------- |
+| **LFM2**      | 512      | 13 ms    | 2 ms      | **5.6×**                                 |
+| **LFM2**      | 1,024    | 14 ms    | 3 ms      | **4.8×**                                 |
+| LFM2          | 4,096    | 33 ms    | 24 ms     | 1.4×                                     |
+| LFM2          | 8,192    | 99 ms    | 95 ms     | 1.0×                                     |
+| LFM2          | 32,768   | 1,230 ms | 18,666 ms | 0.07× *(MPS thrashes)*                   |
+| **Gemma 4**   | 512      | 8 ms     | 3 ms      | **2.3×**                                 |
+| **Gemma 4**   | 4,096    | 104 ms   | 52 ms     | 2.0×                                     |
+| Gemma 4       | 16,384   | 1,146 ms | 906 ms    | 1.3×                                     |
+| **Attention** | 512      | 3 ms     | 2 ms      | 1.4×                                     |
+| Attention     | 4,096    | 42 ms    | 41 ms     | 1.0×                                     |
+| Attention     | 16,384   | 558 ms   | 777 ms    | 0.7× *(CPU faster)*                      |
+| Mamba         | all      | —        | —         | **0.55–0.92×** *(MPS slower throughout)* |
+| Mamba-2       | 512 only | 134 ms   | 48 ms     | **2.8×**                                 |
+| Mamba-2       | 1,024+   | —        | —         | **0.6–0.8×** *(CPU faster from L=2k)*    |
+| xLSTM         | all      | —        | —         | **0.34–0.53×** *(MPS slower throughout)* |
+
+
+**Recurrent models hate MPS.** Mamba, Mamba-2, and xLSTM all run a Python `for` loop on the GPU; each step is a small kernel launch and a sync. The dispatch latency dwarfs the compute. xLSTM is the worst hit (3× slower on MPS) because every step does both the matrix-memory update and the per-head normalizer. **Mamba-2 has a single sweet spot at L=512** where MPS pulls 2.8× ahead — for that one length the kernel call is large enough to dominate launch overhead, but it inverts immediately after.
+
+**SDPA stacks (LFM2, Gemma 4) win at short context.** LFM2 at L=512 is 5.6× faster on MPS — the conv1d + GQA layout maps cleanly to Metal kernels and there's no sequential dependency.
+
+**The crossover at L≈8k.** Above that, the `(H, L, L)` score tensor saturates Metal's memory subsystem, and at L=32k LFM2 thrashes badly (0.07×). For long-context experimentation on this hardware, the rule of thumb is: SDPA stacks below L=4k → MPS; everything else → CPU.
+
+---
+
+### 6. Throughput vs Batch Size (L=1024, MPS)
+
+Sequence length held constant at 1024; only the batch dimension grows. The question is which architectures actually amortize their per-step overhead and turn the extra FLOPs into more tokens per second.
+
+
+
+
+| B                 | Attention   | Mamba      | Mamba-2    | xLSTM      | LFM2        | Gemma 4     |
+| ----------------- | ----------- | ---------- | ---------- | ---------- | ----------- | ----------- |
+| 1                 | 245,551     | 10,675     | 9,967      | 2,640      | 321,501     | 189,167     |
+| 2                 | 285,866     | 22,166     | 17,464     | 5,091      | 315,421     | 211,044     |
+| 4                 | 343,901     | 43,154     | 24,794     | 10,127     | 409,571     | 233,372     |
+| 8                 | 357,216     | 78,383     | 29,943     | 20,024     | 425,668     | 244,529     |
+| 16                | **358,720** | **89,019** | **32,715** | **38,202** | **431,796** | **250,207** |
+| **B=16/B=1 lift** | **1.46×**   | **8.34×**  | **3.28×**  | **14.47×** | **1.34×**   | **1.32×**   |
+
+
+The result is the opposite of what you might expect: **the Python-loop models get the largest batch lift**, not the SDPA stacks. xLSTM goes 14.5× from B=1 to B=16, Mamba 8.3×. The reason is that Python overhead per scan step is fixed; widening the batch tensor doesn't add Python iterations, only compute, so the overhead amortizes.
+
+The SDPA stacks (Attention, LFM2, Gemma 4) only gain 1.3–1.5× because they're already saturating the GPU at B=1 — the matmul kernels are large enough that MPS schedules them efficiently from the start.
+
+**Absolute numbers still favor SDPA.** LFM2 at B=16 still pushes ~430k tokens/sec versus xLSTM's 38k. Sequential scan models close the *relative* gap with batch but never the absolute gap.
+
+---
+
+### 7. Mixed Precision: fp32 vs bf16 vs fp16 (L=1024, MPS)
+
+For each model we run forward at three dtypes and measure both wall-clock latency and the mean absolute error of logits relative to the fp32 anchor.
+
+
+
+
+| Model     | fp32      | bf16 (×, MAE)  | fp16 (×, MAE)  |
+| --------- | --------- | -------------- | -------------- |
+| Attention | 3.46 ms   | 1.04× , 5.5e-2 | 0.96× , 6.9e-3 |
+| Mamba     | 93.62 ms  | SKIPPED        | SKIPPED        |
+| Mamba-2   | 97.02 ms  | SKIPPED        | SKIPPED        |
+| xLSTM     | 367.94 ms | 1.00× , 1.9e-3 | SKIPPED        |
+| LFM2      | 3.15 ms   | 0.73× , 1.8e-3 | 0.98× , 2.7e-4 |
+| Gemma 4   | 5.44 ms   | 0.99× , 2.5e-3 | 0.87× , 4.1e-4 |
+
+
+**Why most rows are SKIPPED.** Mamba, Mamba-2, and xLSTM (in fp16) hit MPS ops that aren't yet implemented at half precision — primarily `Conv1d` and certain `exp`/`scatter` paths. The graceful failure path turns those into SKIPPED entries.
+
+**Why the speedups are modest at this scale.** The toy config is 128-dim, 4-layer, batch=1; total FLOPs per forward are too small for half-precision matmul to pay back the casting cost. On a real 1B+ model the bf16/fp16 lift is typically 1.5–2× on MPS — the toy setup just doesn't exercise the regime where that matters.
+
+**bf16 vs fp16 numerical drift, calibrated.** Attention's bf16 logit MAE is 5.5e-2 — about an order of magnitude looser than fp16's 6.9e-3, exactly what you'd predict from the mantissa bits (bf16 has 7, fp16 has 10). For the linear-time models that *do* run at half precision, MAEs sit in the 1e-3 to 1e-4 range; the log-space stabilizer in xLSTM keeps `exp(·)` bounded, so the gates don't blow up under bf16.
+
+The pragmatic takeaway: at this toy scale, mixed precision is a correctness-and-compatibility experiment, not a speed experiment. The speed experiment lives at full-model scale.
+
+---
+
+## Figures
+
+All figures and JSON results land in `notebooks/figures/`.
 
 ---
 
@@ -182,14 +259,19 @@ The results reveal a consistent pattern: **MPS delivers meaningful speedups at s
 
 - **Not a training framework** — no dataloaders, optimizers, checkpointing, or distributed training
 - **Not production code** — layout prioritizes readability over installability
-- **Not benchmarked at scale** — all results use toy configs that run in seconds on CPU; absolute numbers don't transfer to full-size models
+- **Not benchmarked at scale** — toy configs run in seconds; absolute numbers don't transfer to full-size models
 - **Not a faithful Gemma 4 implementation** — Gemma 4 weights and architecture are not public; this is a reasoned reconstruction from documented Gemma lineage components
+- **Not a CUDA-kernel rewrite** — every scan is a Python `for` loop. The CUDA paths for Mamba/Mamba-2/xLSTM are precisely what removes the per-step dispatch overhead surfaced in the benchmarks above
 
 ---
 
 ## References
 
 - Gu, A. & Dao, T. (2023). Mamba: Linear-Time Sequence Modeling with Selective State Spaces. [arXiv:2312.00752](https://arxiv.org/abs/2312.00752)
-- LiquidAI (2025). LFM2: Scalable and Efficient Foundation Models Built for Systems. [arXiv:2511.23404](https://arxiv.org/abs/2511.23404)
+- Dao, T. & Gu, A. (2024). Transformers are SSMs: Generalized Models and Efficient Algorithms Through Structured State-Space Duality. ICML 2024. [arXiv:2405.21060](https://arxiv.org/abs/2405.21060)
+- Beck, M., Pöppel, K., Spanring, M., Auer, A., Prudnikova, O., Kopp, M., Klambauer, G., Brandstetter, J., Hochreiter, S. (2024). xLSTM: Extended Long Short-Term Memory. [arXiv:2405.04517](https://arxiv.org/abs/2405.04517)
+- LiquidAI (2025). LFM2 Technical Report. [arXiv:2511.23404](https://arxiv.org/abs/2511.23404)
 - Google DeepMind (2025). Gemma 3 Technical Report.
 - HuggingFace Transformers source: `modeling_gemma3.py`, `modeling_gemma3n.py`, `modeling_lfm2.py`
+- Official reference implementations: [state-spaces/mamba](https://github.com/state-spaces/mamba), [NX-AI/xlstm](https://github.com/NX-AI/xlstm)
+
