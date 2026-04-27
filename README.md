@@ -28,29 +28,17 @@ This repo implements all three at toy scale and benchmarks them across memory, i
 
 The selective SSM core, implemented in pure Python/PyTorch without CUDA kernels. The scan runs as a sequential recurrence loop, which makes the state transition structure easy to follow but sacrifices the parallelism of the official CUDA implementation. Includes the S4D-Real `A` matrix initialization, the `dt_proj` bias trick from the paper, and GPT-NeoX-style residual scaling.
 
-```bash
-uv run mamba/main.py
-```
-
 ### [LFM2](./lfm2/) — Liquid Foundation Model 2
 
 > LiquidAI, *LFM2 Technical Report*, arXiv:2511.23404 (2025)
 
 Hybrid backbone interleaving 10 gated short-convolution blocks with 6 GQA attention blocks in a single residual stack. The toy config uses 4 layers with 2 attention layers (50% attention ratio) — this is **not** ratio-matched to the released `LiquidAI/LFM2-350M` checkpoint, which sits at 6/16 ≈ 37.5%. The toy config is intentionally small for CPU runnability; the benchmark numbers reflect this specific mix, not the production ratio. The key architectural insight — that convolution and attention can share a residual stream without structural gymnastics — is immediately visible in `forward()`.
 
-```bash
-uv run lfm2/main.py
-```
-
 ### [Gemma 4](./gemma4/) — Speculative Reconstruction
 
 > Synthesized from: Google DeepMind, *Gemma 3 Technical Report* (2025) + Gemma 3n model card
 
 **Gemma 4 has not released a public technical report.** This is a speculative reconstruction that assembles documented pieces of the Gemma lineage: Per-Layer Embeddings (PLE) from Gemma 3n, sliding-window + global attention interleaving from Gemma 3, sandwich norm from Gemma 2/3, and GeGLU FFN. Labeled speculative intentionally — the goal is reasoning about what Gemma 4 *likely* does, not claiming accuracy.
-
-```bash
-uv run gemma4/main.py
-```
 
 ---
 
